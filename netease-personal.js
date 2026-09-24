@@ -1,5 +1,5 @@
 /*
- * 网易云个人账号 / MusicFree 0.1.11
+ * 网易云个人账号 / MusicFree 0.1.12
  * Read-only account integration. Cookie is read from local plugin settings.
  * Protocol reference: NeteaseCloudMusicApiEnhanced/api-enhanced (MIT).
  * Copyright (c) 2013-2022 Binaryify
@@ -33,7 +33,7 @@ const DIAGNOSTIC_SONG = '167655'; // 许嵩《幻听》，通过网易云搜索�
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const PAGE_SIZE = 30;
 const TRACK_PAGE_SIZE = 50;
-const VERSION = '0.1.11';
+const VERSION = '0.1.12';
 const MODULUS = 'e0b509f6259df8642dbc35662901477df22677ec152b5ff68ace615bb7b725152b3ab17a876aea8a5aa76d2e417629ec4ee341f56135fccf695280104e0312ecbda92557c93870114af6c9d05c4f7f0c3685b7a46bee255932575cce10b424d813cfe4875d3e82047b97ddef52741d546b8e289dc6935b3ece0462db0a22b8e7';
 const READ_PATHS = [
   '/api/cloudsearch/pc', '/api/w/nuser/account/get', '/api/user/playlist',
@@ -49,6 +49,7 @@ const songCache = new Map();
 const personalListCache = new Map();
 const catalogCache = new Map();
 const discoveryCache = new Map();
+const lyricCache = new Map();
 const pendingReads = new Map();
 
 function cacheGet(cache, key) {
@@ -82,6 +83,7 @@ function clearAccountCaches() {
   songCache.clear();
   personalListCache.clear();
   catalogCache.clear();
+  lyricCache.clear();
   pendingReads.clear();
 }
 
@@ -376,15 +378,51 @@ async function albumPage(item, page, ctx) {
   };
 }
 
-async function account(ctx) {
+async function account(ctx, fresh) {
   if (!ctx.cookie) throw new Error('请先在插件设置中填写网易云 Cookie，再打开个人歌单。');
+  if (fresh) return loadAccount(ctx);
   if (accountCache && accountCache.fingerprint === ctx.fingerprint && accountCache.expires > Date.now()) return accountCache.uid;
+  return shareRead('account|' + ctx.fingerprint, function () { return loadAccount(ctx); });
+}
+
+async function loadAccount(ctx) {
   // Match the account endpoint observed in the official website.
   const body = await request('/api/w/nuser/account/get', {}, ctx);
   const uid = body.profile && body.profile.userId || body.account && body.account.id;
   if (!uid) throw new Error('未识别到网易云账号，请更新 Cookie 后重试。');
   if (activeFingerprint === ctx.fingerprint) accountCache = { uid: String(uid), fingerprint: ctx.fingerprint, expires: Date.now() + 300000 };
   return String(uid);
+}
+
+async function lyrics(item, ctx) {
+  const id = mediaId(item.id);
+  const key = ctx.fingerprint + '|' + id;
+  let result = cacheGet(lyricCache, key);
+  if (!result) {
+    const body = await request('/api/song/lyric', { id: id, lv: -1, tv: -1, rv: -1, kv: -1, _nmclfl: 1 }, ctx);
+    const raw = body.lrc && body.lrc.lyric;
+    const translation = body.tlyric && body.tlyric.lyric;
+    result = { rawLrc: typeof raw === 'string' ? raw : '', translation: typeof translation === 'string' ? translation : '' };
+    // Empty/malformed replies may be transient. Only explicit instrumental
+    // responses or real text qualify; cap both item count and text size.
+    if ((result.rawLrc || result.translation || body.nolyric === true) &&
+      result.rawLrc.length + result.translation.length <= 65536 && activeFingerprint === ctx.fingerprint) {
+      cachePut(lyricCache, key, result, 300000, 40);
+    }
+  }
+  return Object.assign({}, result);
+}
+
+async function personalSheets(uid, page, limit, ctx) {
+  const body = await request('/api/user/playlist', { uid: uid, limit: limit, offset: (page - 1) * limit, includeVideo: false }, ctx);
+  if (!Array.isArray(body.playlist)) throw new Error('无法读取个人歌单，请更新 Cookie 后重试。');
+  return body;
+}
+
+function likedSheets(sheets, uid) {
+  return sheets.filter(function (sheet) {
+    return Number(sheet.specialType) === 5 && sheet.creator && String(sheet.creator.userId) === uid;
+  });
 }
 
 async function playlist(id, ctx, allTracks) {
@@ -657,7 +695,7 @@ async function diagnoseAccount() {
   let uid;
   try {
     accountCache = null;
-    uid = await account(ctx);
+    uid = await account(ctx, true);
     rows.push(accountCheckRow(2, '登录检查成功'));
   } catch (error) {
     const failure = diagnosticFailure(error);
@@ -699,7 +737,7 @@ async function diagnosePlayback(song) {
   try {
     // Bypass the account cache so this report reflects a fresh server check.
     accountCache = null;
-    await account(ctx);
+    await account(ctx, true);
     add('登录：网易云已识别账号', '账号已识别不等于每首歌曲、每档音质均有权限。');
   } catch (error) {
     add('登录：' + diagnosticFailure(error));
@@ -782,8 +820,7 @@ module.exports = {
   },
 
   async getLyric(item) {
-    const body = await request('/api/song/lyric', { id: mediaId(item.id), lv: -1, tv: -1, rv: -1, kv: -1, _nmclfl: 1 }, settings());
-    return { rawLrc: body.lrc && body.lrc.lyric || '', translation: body.tlyric && body.tlyric.lyric || '' };
+    return lyrics(item, settings());
   },
 
   async getMusicInfo(item) {
@@ -838,17 +875,18 @@ module.exports = {
     const liked = tag && tag.id === 'liked';
     if (liked && current > 1) return { isEnd: true, data: [] };
     const uid = await account(ctx);
-    const limit = liked ? 1000 : PAGE_SIZE;
-    const body = await request('/api/user/playlist', { uid: uid, limit: limit, offset: (current - 1) * limit, includeVideo: false }, ctx);
-    if (!Array.isArray(body.playlist)) throw new Error('无法读取个人歌单，请更新 Cookie 后重试。');
+    const body = await personalSheets(uid, current, PAGE_SIZE, ctx);
     if (liked) {
-      const matches = body.playlist.filter(function (sheet) {
-        return Number(sheet.specialType) === 5 && sheet.creator && String(sheet.creator.userId) === uid;
-      });
+      let matches = likedSheets(body.playlist, uid);
+      // Share the first-page query with the normal list. Retain the previous
+      // 1000-entry lookup as a fallback when the liked sheet is not on page 1.
+      if (!matches.length && body.more !== false) {
+        matches = likedSheets((await personalSheets(uid, 1, 1000, ctx)).playlist, uid);
+      }
       if (!matches.length) throw new Error('未找到“我喜欢的音乐”歌单，请在“我的歌单”分类中查找。');
       return { isEnd: true, data: matches.map(sheetItem) };
     }
-    return { isEnd: body.more === false || body.playlist.length < limit, data: body.playlist.map(sheetItem) };
+    return { isEnd: body.more === false || body.playlist.length < PAGE_SIZE, data: body.playlist.map(sheetItem) };
   },
 
   async getMusicSheetInfo(item, page) {
