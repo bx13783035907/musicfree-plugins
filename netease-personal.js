@@ -1,5 +1,5 @@
 /*
- * 网易云个人账号 / MusicFree 0.1.12
+ * 网易云个人账号 / MusicFree 0.1.13
  * Read-only account integration. Cookie is read from local plugin settings.
  * Protocol reference: NeteaseCloudMusicApiEnhanced/api-enhanced (MIT).
  * Copyright (c) 2013-2022 Binaryify
@@ -33,7 +33,7 @@ const DIAGNOSTIC_SONG = '167655'; // 许嵩《幻听》，通过网易云搜索�
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const PAGE_SIZE = 30;
 const TRACK_PAGE_SIZE = 50;
-const VERSION = '0.1.12';
+const VERSION = '0.1.13';
 const MODULUS = 'e0b509f6259df8642dbc35662901477df22677ec152b5ff68ace615bb7b725152b3ab17a876aea8a5aa76d2e417629ec4ee341f56135fccf695280104e0312ecbda92557c93870114af6c9d05c4f7f0c3685b7a46bee255932575cce10b424d813cfe4875d3e82047b97ddef52741d546b8e289dc6935b3ece0462db0a22b8e7';
 const READ_PATHS = [
   '/api/cloudsearch/pc', '/api/w/nuser/account/get', '/api/user/playlist',
@@ -342,18 +342,32 @@ async function loadArtistBiography(item, ctx) {
   }
 }
 
-async function addArtistBiographies(items, ctx) {
+async function addArtistBiographies(items, ctx, keyword) {
   // MusicFree takes the artist header from the search result and does not merge
   // artist metadata returned by getArtistWorks. Enrich before returning results.
-  const bioContext = Object.assign({}, ctx, { deadline: Math.min(ctx.deadline, Date.now() + 5000) });
-  let cursor = 0;
-  async function worker() {
-    while (cursor < items.length) {
-      const item = items[cursor++];
-      if (!item.description) item.description = await artistBiography(item, bioContext);
+  // Do not fetch a biography page for every fuzzy search match. Reuse all
+  // available descriptions, then enrich exact names (or the first 3 results)
+  // in a single bounded batch so unrelated artists cannot delay the target.
+  const query = String(keyword || '').trim().toLowerCase();
+  const exact = items.filter(function (item) { return item.name.trim().toLowerCase() === query; });
+  const selected = new Set((exact.length ? exact : items).slice(0, 3));
+  const bioContext = Object.assign({}, ctx, { deadline: Math.min(ctx.deadline, Date.now() + 1200) });
+  const pending = [];
+  items.forEach(function (item) {
+    if (item.description) return;
+    const cached = biographyCache.filter(function (entry) {
+      return entry.id === item.id && entry.fingerprint === ctx.fingerprint && entry.expires > Date.now();
+    })[0];
+    if (cached) { item.description = cached.description; return; }
+    if (!ctx.cookie) {
+      item.description = '登录后可查看歌手简介，请在插件设置中配置网易云 Cookie。';
+    } else if (selected.has(item)) {
+      pending.push(artistBiography(item, bioContext).then(function (description) { item.description = description; }));
+    } else {
+      item.description = '搜索该歌手的完整名称可查看个人简介。';
     }
-  }
-  await Promise.all([worker(), worker(), worker()]);
+  });
+  await Promise.all(pending);
   return items;
 }
 
@@ -808,7 +822,7 @@ module.exports = {
     if (!Array.isArray(list)) throw new Error('网易云搜索结果格式异常，请稍后重试。');
     const data = list.map(category.map);
     if (type === 'music') rememberSongs(list, ctx);
-    if (type === 'artist') await addArtistBiographies(data, ctx);
+    if (type === 'artist') await addArtistBiographies(data, ctx, keyword);
     return {
       isEnd: list.length === 0 || (typeof total === 'number' ? offset + list.length >= total : list.length < PAGE_SIZE),
       data: data
