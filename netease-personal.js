@@ -1,5 +1,5 @@
 /*
- * 网易云个人账号 / MusicFree 0.1.13
+ * 网易云个人账号 / MusicFree 0.1.14
  * Read-only account integration. Cookie is read from local plugin settings.
  * Protocol reference: NeteaseCloudMusicApiEnhanced/api-enhanced (MIT).
  * Copyright (c) 2013-2022 Binaryify
@@ -29,11 +29,10 @@ const cheerio = require('cheerio');
 const ORIGIN = 'https://music.163.com';
 const CLIENT_ORIGIN = 'https://interfacepc.music.163.com';
 const DIAGNOSTIC_PREFIX = '__netease_diagnostic_';
-const DIAGNOSTIC_SONG = '167655'; // 许嵩《幻听》，通过网易云搜索确认
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const PAGE_SIZE = 30;
 const TRACK_PAGE_SIZE = 50;
-const VERSION = '0.1.13';
+const VERSION = '0.1.14';
 const MODULUS = 'e0b509f6259df8642dbc35662901477df22677ec152b5ff68ace615bb7b725152b3ab17a876aea8a5aa76d2e417629ec4ee341f56135fccf695280104e0312ecbda92557c93870114af6c9d05c4f7f0c3685b7a46bee255932575cce10b424d813cfe4875d3e82047b97ddef52741d546b8e289dc6935b3ece0462db0a22b8e7';
 const READ_PATHS = [
   '/api/cloudsearch/pc', '/api/w/nuser/account/get', '/api/user/playlist',
@@ -433,12 +432,6 @@ async function personalSheets(uid, page, limit, ctx) {
   return body;
 }
 
-function likedSheets(sheets, uid) {
-  return sheets.filter(function (sheet) {
-    return Number(sheet.specialType) === 5 && sheet.creator && String(sheet.creator.userId) === uid;
-  });
-}
-
 async function playlist(id, ctx, allTracks) {
   const key = mediaId(id);
   const cached = sheetCache.filter(function (entry) {
@@ -605,18 +598,77 @@ async function loadTopLists() {
   return groups;
 }
 
+function shareUrls(input) {
+  return (String(input || '').replace(/&amp;/gi, '&').match(/https?:\/\/[^\s<>"'，。；、）】》]+/gi) || [])
+    .map(function (value) { return value.replace(/[),;.!\]}]+$/, ''); });
+}
+
 function idFromInput(input, kind) {
-  const text = String(input || '').trim();
+  const text = String(input || '').trim().replace(/&amp;/gi, '&');
   if (/^[1-9][0-9]*$/.test(text)) return text;
-  // Parse known full URLs only. Never fetch a user-supplied URL with Cookie.
-  const host = text.match(/^https?:\/\/([^/?#]+)\//i);
-  if (!host || !/^(?:music\.163\.com|y\.music\.163\.com)$/i.test(host[1])) {
-    throw new Error('请粘贴网易云完整' + (kind === 'song' ? '歌曲' : '歌单') + '链接或数字 ID（暂不支持短链接）。');
+  // Share text often surrounds the URL with a title and Chinese punctuation.
+  // Extract complete URLs, then validate host, route and ID independently.
+  // Parsing never sends credentials to a pasted URL.
+  const urls = shareUrls(text);
+  const ids = new Set();
+  urls.forEach(function (value) {
+    const url = value.replace(/[),;.!\]}]+$/, '');
+    const host = url.match(/^https?:\/\/(music\.163\.com|y\.music\.163\.com)(\/[^\s]*)$/i);
+    if (!host) return;
+    let route = host[2];
+    const hash = route.indexOf('#/');
+    if (hash >= 0) route = route.slice(hash + 1);
+    const match = route.match(/^\/(?:m\/)?(song|playlist)\/?\?([^#]*)/i);
+    if (!match || match[1].toLowerCase() !== kind) return;
+    const values = match[2].split('&').filter(function (part) { return part.split('=')[0] === 'id'; });
+    if (values.length !== 1) return;
+    let id;
+    try { id = decodeURIComponent(values[0].slice(3)); } catch (_) { return; }
+    if (/^[1-9][0-9]*$/.test(id)) ids.add(id);
+  });
+  if (ids.size === 1) return ids.values().next().value;
+  if (ids.size > 1) throw new Error('检测到多个不同链接，请每次只导入一首歌曲或一个歌单。');
+  throw new Error('未找到有效的网易云' + (kind === 'song' ? '歌曲' : '歌单') + '链接，请复制完整分享链接或数字 ID。');
+}
+
+async function importId(input, kind, ctx) {
+  let parseError;
+  try { return idFromInput(input, kind); } catch (error) { parseError = error; }
+  const urls = shareUrls(input);
+  // Only resolve the official short-link host observed in the user's share.
+  // All other inputs remain local parsing; never pass account credentials here.
+  if (urls.length !== 1 || !/^https?:\/\/163cn\.tv\/[a-zA-Z0-9_-]{1,64}\/?(?:\?[^#\s]*)?$/i.test(urls[0])) throw parseError;
+  const shortUrl = urls[0].replace(/^http:/i, 'https:');
+  const remaining = ctx.deadline - Date.now();
+  if (remaining < 100) throw new Error('短链接解析超时，请稍后重试。');
+  let response;
+  try {
+    response = await axios.get(shortUrl, {
+      headers: Object.assign(Object.create(null), { 'User-Agent': UA }),
+      withCredentials: false, timeout: Math.min(6500, remaining), maxRedirects: 0,
+      maxContentLength: 1024 * 1024, validateStatus: function () { return true; }
+    });
+  } catch (_) { throw new Error('网易云短链接解析失败或超时，请重试或使用完整歌曲/歌单链接。'); }
+  const candidates = [];
+  // Node preserves the 302 Location. Android XHR may follow redirects itself.
+  if ([301, 302, 303, 307, 308].indexOf(response.status) >= 0) {
+    candidates.push(response.headers && (response.headers.location || response.headers.Location));
+  } else if (response.status === 200) {
+    candidates.push(response.request && response.request.responseURL);
+    // Official mobile share pages expose canonical / og:url links; these also
+    // work when the host's network bridge does not expose the final URL.
+    if (typeof response.data === 'string' && response.data.length <= 1024 * 1024) {
+      const dom = cheerio.load(response.data);
+      dom('link[rel="canonical"],meta[property="og:url"]').each(function (_, element) {
+        candidates.push(dom(element).attr('href') || dom(element).attr('content'));
+      });
+    }
   }
-  const path = new RegExp('(?:/|#/)'+ kind + '(?:\\?|/|$)');
-  const query = text.match(/[?&]id=([1-9][0-9]*)(?:[&#]|$)/);
-  if (path.test(text) && query) return query[1];
-  throw new Error('链接类型或 ID 无效，请复制网易云完整链接。');
+  for (let i = 0; i < candidates.length; i += 1) {
+    if (typeof candidates[i] !== 'string') continue;
+    try { return idFromInput(candidates[i], kind); } catch (_) {}
+  }
+  throw new Error('短链接未返回有效的网易云' + (kind === 'song' ? '歌曲' : '歌单') + '地址，请确认分享类型或复制完整链接。');
 }
 
 function playbackSource(body, id) {
@@ -729,52 +781,6 @@ async function diagnoseAccount() {
   return rows;
 }
 
-async function diagnosePlayback(song) {
-  const targetId = song === 'sudi' ? '167691' : DIAGNOSTIC_SONG;
-  const targetTitle = song === 'sudi' ? '天龙八部之宿敌' : '幻听';
-  const rows = [];
-  function add(title, detail) {
-    rows.push({
-      id: DIAGNOSTIC_PREFIX + targetId + '_' + String(rows.length + 1),
-      title: title, description: detail || title,
-      artist: '诊断报告 · v' + VERSION, worksNum: 0
-    });
-  }
-  add(VERSION + ' · 许嵩《' + targetTitle + '》播放诊断', '测试歌曲 ID：' + targetId + '。仅检查登录和标准音质播放地址，不下载音频。结果不含账号凭证。');
-  let ctx;
-  try { ctx = settings(); } catch (error) {
-    add('Cookie：格式不正确', diagnosticFailure(error));
-    return rows;
-  }
-  add(ctx.cookie ? 'Cookie：插件已读到配置' : 'Cookie：插件未读到配置');
-  if (!ctx.cookie) return rows;
-  try {
-    // Bypass the account cache so this report reflects a fresh server check.
-    accountCache = null;
-    await account(ctx, true);
-    add('登录：网易云已识别账号', '账号已识别不等于每首歌曲、每档音质均有权限。');
-  } catch (error) {
-    add('登录：' + diagnosticFailure(error));
-    return rows;
-  }
-  const transports = [{ name: '网页播放', value: undefined }, { name: '客户端播放', value: 'client' }];
-  for (let i = 0; i < transports.length; i += 1) {
-    const transport = transports[i];
-    try {
-      const body = await request('/api/song/enhance/player/url/v1', {
-        ids: '[' + targetId + ']', level: 'standard', encodeType: 'mp3'
-      }, ctx, transport.value);
-      const source = playbackSource(body, targetId);
-      add(transport.name + '：' + (playable(source) ? '已取得整曲地址' : playbackSummary(source)),
-        playbackSummary(source) + '。此结果只验证音源接口，不代表播放器已成功解码。');
-    } catch (error) {
-      add(transport.name + '：' + diagnosticFailure(error));
-    }
-  }
-  add('请截取这些结果用于排查', '报告仅含固定说明和状态码，不包含 Cookie、账号 ID 或音频地址。无需点击播放诊断条目。');
-  return rows;
-}
-
 module.exports = {
   platform: '网易云个人账号',
   version: VERSION,
@@ -790,8 +796,8 @@ module.exports = {
     hint: '填写 MUSIC_U 值或完整 Cookie；不要公开分享。'
   }],
   hints: {
-    importMusicItem: ['支持网易云完整歌曲链接或数字 ID，暂不支持短链接。'],
-    importMusicSheet: ['支持网易云完整歌单链接或数字 ID。超过 1000 首请从推荐歌单入口分页浏览。']
+    importMusicItem: ['支持网易云歌曲分享文字、完整链接、163cn.tv 短链接或数字 ID。'],
+    importMusicSheet: ['支持网易云歌单分享文字、完整链接、163cn.tv 短链接或数字 ID。超过 1000 首请从推荐歌单入口分页浏览。']
   },
 
   async search(query, page, type) {
@@ -805,9 +811,8 @@ module.exports = {
     const category = categories[type];
     const keyword = String(query || '').trim();
     if (!keyword) return { isEnd: true, data: [] };
-    if (type === 'sheet' && /^(?:账号检查|账号诊断|播放诊断|宿敌诊断)$/.test(keyword)) {
-      return { isEnd: true, data: pageNumber(page) > 1 ? [] :
-        /^(?:账号检查|账号诊断)$/.test(keyword) ? await diagnoseAccount() : await diagnosePlayback(keyword === '宿敌诊断' ? 'sudi' : undefined) };
+    if (type === 'sheet' && /^(?:账号检查|账号诊断)$/.test(keyword)) {
+      return { isEnd: true, data: pageNumber(page) > 1 ? [] : await diagnoseAccount() };
     }
     const ctx = settings();
     const offset = (pageNumber(page) - 1) * PAGE_SIZE;
@@ -871,35 +876,20 @@ module.exports = {
   },
 
   async getRecommendSheetTags() {
-    const checks = [{ id: 'account-check', title: '账号检查' }, { id: 'sudi-check', title: '宿敌诊断' }, { id: 'diagnostic', title: '播放诊断' }];
-    return { pinned: [checks[0], { id: 'public', title: '热门歌单' }, { id: 'my', title: '我的歌单' }, { id: 'liked', title: '我喜欢的音乐' }, checks[1], checks[2]],
-      data: [{ title: '问题排查', data: checks }] };
+    const tags = [{ id: 'public', title: '热门歌单' }, { id: 'my', title: '我的歌单' }, { id: 'account-check', title: '账号检查' }];
+    return { pinned: tags, data: [{ title: '歌单分类', data: tags }] };
   },
 
   async getRecommendSheetsByTag(tag, page) {
     if (!tag || !tag.id || tag.id === 'public') return publicSheets(page);
     if (tag.id === 'account-check') return { isEnd: true, data: pageNumber(page) > 1 ? [] : await diagnoseAccount() };
-    if (tag.id === 'sudi-check') return { isEnd: true, data: pageNumber(page) > 1 ? [] : await diagnosePlayback('sudi') };
-    if (tag && tag.id === 'diagnostic') {
-      return { isEnd: true, data: pageNumber(page) > 1 ? [] : await diagnosePlayback() };
-    }
-    if (tag.id !== 'my' && tag.id !== 'liked') throw new Error('不支持的歌单分类，请重新选择分类。');
+    // Old open pages may briefly retain removed tag IDs after an update.
+    if (['liked', 'sudi-check', 'diagnostic'].indexOf(tag.id) >= 0) return { isEnd: true, data: [] };
+    if (tag.id !== 'my') throw new Error('不支持的歌单分类，请重新选择分类。');
     const ctx = settings();
     const current = pageNumber(page);
-    const liked = tag && tag.id === 'liked';
-    if (liked && current > 1) return { isEnd: true, data: [] };
     const uid = await account(ctx);
     const body = await personalSheets(uid, current, PAGE_SIZE, ctx);
-    if (liked) {
-      let matches = likedSheets(body.playlist, uid);
-      // Share the first-page query with the normal list. Retain the previous
-      // 1000-entry lookup as a fallback when the liked sheet is not on page 1.
-      if (!matches.length && body.more !== false) {
-        matches = likedSheets((await personalSheets(uid, 1, 1000, ctx)).playlist, uid);
-      }
-      if (!matches.length) throw new Error('未找到“我喜欢的音乐”歌单，请在“我的歌单”分类中查找。');
-      return { isEnd: true, data: matches.map(sheetItem) };
-    }
     return { isEnd: body.more === false || body.playlist.length < PAGE_SIZE, data: body.playlist.map(sheetItem) };
   },
 
@@ -920,14 +910,15 @@ module.exports = {
   },
 
   async importMusicItem(input) {
-    const songs = await songsByIds([idFromInput(input, 'song')], settings());
+    const ctx = settings();
+    const songs = await songsByIds([await importId(input, 'song', ctx)], ctx);
     if (!songs.length) throw new Error('歌曲不存在或暂时不可访问。');
     return songs[0];
   },
 
   async importMusicSheet(input) {
     const ctx = settings();
-    const sheet = await playlist(idFromInput(input, 'playlist'), ctx, true);
+    const sheet = await playlist(await importId(input, 'playlist', ctx), ctx, true);
     if (sheet.trackIds.length > 1000) throw new Error('歌单超过 1000 首，请从推荐歌单入口分页浏览，避免导入超时。');
     return songsByIds(sheet.trackIds.map(function (track) { return track.id; }), ctx, Array.isArray(sheet.tracks) ? sheet.tracks : []);
   }
