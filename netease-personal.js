@@ -1,5 +1,5 @@
 /*
- * 网易云个人账号 / MusicFree 0.1.14
+ * 网易云个人账号 / MusicFree 0.1.15
  * Read-only account integration. Cookie is read from local plugin settings.
  * Protocol reference: NeteaseCloudMusicApiEnhanced/api-enhanced (MIT).
  * Copyright (c) 2013-2022 Binaryify
@@ -30,9 +30,20 @@ const ORIGIN = 'https://music.163.com';
 const CLIENT_ORIGIN = 'https://interfacepc.music.163.com';
 const DIAGNOSTIC_PREFIX = '__netease_diagnostic_';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const MOBILE_UA = 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36';
 const PAGE_SIZE = 30;
 const TRACK_PAGE_SIZE = 50;
-const VERSION = '0.1.14';
+const VERSION = '0.1.15';
+// Snapshot of the official public playlist selector, observed 2026-10-04.
+// Keep tag discovery local and restrict request parameters to this allowlist.
+const SHEET_CATEGORIES = [
+  { title: '语种', names: ['华语', '欧美', '日语', '韩语', '粤语'] },
+  { title: '风格', names: ['流行', '摇滚', '民谣', '电子', '舞曲', '说唱', '轻音乐', '爵士', '乡村', 'R&B/Soul', '古典', '民族', '英伦', '金属', '朋克', '蓝调', '雷鬼', '世界音乐', '拉丁', 'New Age', '古风', '后摇', 'Bossa Nova'] },
+  { title: '场景', names: ['清晨', '夜晚', '学习', '工作', '午休', '下午茶', '地铁', '驾车', '运动', '旅行', '散步', '酒吧'] },
+  { title: '情感', names: ['怀旧', '清新', '浪漫', '伤感', '治愈', '放松', '孤独', '感动', '兴奋', '快乐', '安静', '思念'] },
+  { title: '主题', names: ['综艺', '影视原声', 'ACG', '儿童', '校园', '游戏', '70后', '80后', '90后', '网络歌曲', 'KTV', '经典', '翻唱', '吉他', '钢琴', '器乐', '榜单', '00后'] }
+];
+const SHEET_CATEGORY_NAMES = [].concat.apply([], SHEET_CATEGORIES.map(function (group) { return group.names; }));
 const MODULUS = 'e0b509f6259df8642dbc35662901477df22677ec152b5ff68ace615bb7b725152b3ab17a876aea8a5aa76d2e417629ec4ee341f56135fccf695280104e0312ecbda92557c93870114af6c9d05c4f7f0c3685b7a46bee255932575cce10b424d813cfe4875d3e82047b97ddef52741d546b8e289dc6935b3ece0462db0a22b8e7';
 const READ_PATHS = [
   '/api/cloudsearch/pc', '/api/w/nuser/account/get', '/api/user/playlist',
@@ -519,14 +530,16 @@ async function sheetPage(item, page, ctx) {
 
 // Public discovery pages observed on music.163.com. Never attach account
 // credentials to these requests, or follow a URL supplied by a page or tag.
-async function discoveryPage(kind, page) {
+async function discoveryPage(kind, page, category) {
   const current = pageNumber(page);
-  const path = kind === 'charts' ? '/discover/toplist' : current === 1 ? '/discover/playlist' :
-    '/discover/playlist/?order=hot&cat=' + encodeURIComponent('全部') + '&limit=35&offset=' + ((current - 1) * 35);
+  const name = category || '全部';
+  const path = kind === 'charts' ? '/discover/toplist' : current === 1 && name === '全部' ? '/discover/playlist' :
+    '/discover/playlist/?order=hot&cat=' + encodeURIComponent(name) + '&limit=35&offset=' + ((current - 1) * 35);
+  const editor = kind === 'editor';
   let response;
   try {
-    response = await axios.get(ORIGIN + path, {
-      headers: Object.assign(Object.create(null), { 'User-Agent': UA, Referer: ORIGIN + '/' }),
+    response = await axios.get(editor ? 'https://y.music.163.com/m/' : ORIGIN + path, {
+      headers: Object.assign(Object.create(null), { 'User-Agent': editor ? MOBILE_UA : UA, Referer: ORIGIN + '/' }),
       withCredentials: false,
       timeout: 6500, maxRedirects: 0, maxContentLength: 2000000,
       validateStatus: function () { return true; }
@@ -554,13 +567,15 @@ async function cachedDiscovery(key, load) {
   return JSON.parse(JSON.stringify(value));
 }
 
-async function publicSheets(page) {
+async function publicSheets(page, category) {
   const current = pageNumber(page);
-  return cachedDiscovery('sheets|' + current, function () { return loadPublicSheets(current); });
+  const name = category == null ? '全部' : category;
+  if (name !== '全部' && SHEET_CATEGORY_NAMES.indexOf(name) < 0) throw new Error('不支持的歌单分类，请重新选择分类。');
+  return cachedDiscovery('sheets|' + name + '|' + current, function () { return loadPublicSheets(current, name); });
 }
 
-async function loadPublicSheets(page) {
-  const $ = await discoveryPage('sheets', page);
+async function loadPublicSheets(page, category) {
+  const $ = await discoveryPage('sheets', page, category);
   const data = [];
   $('.m-cvrlst li').each(function (_, element) {
     const row = $(element);
@@ -572,6 +587,28 @@ async function loadPublicSheets(page) {
   });
   if (!data.length) throw new Error('网易云未返回公开推荐歌单，请稍后重试。');
   return { isEnd: !$('.u-page .znxt:not(.js-disabled)[href^="/discover/playlist"]').length, data: data };
+}
+
+async function editorSheets(page) {
+  // The official mobile home shows one finite editorial selection, not pages.
+  if (pageNumber(page) > 1) return { isEnd: true, data: [] };
+  return cachedDiscovery('editor', async function () {
+    const $ = await discoveryPage('editor', 1);
+    const data = [];
+    const seen = new Set();
+    $('.remd_songs a.remd_li').each(function (_, element) {
+      const row = $(element);
+      const match = (row.attr('href') || '').match(/^(?:https?:)?\/\/y\.music\.163\.com\/m\/playlist\?id=([1-9][0-9]*)$/);
+      const title = row.find('.remd_text').text().trim();
+      if (!match || !title || seen.has(match[1])) return;
+      seen.add(match[1]);
+      const image = row.find('img').attr('src') || '';
+      data.push({ id: match[1], title: title, artist: '网易云编辑推荐',
+        artwork: publicArtwork(image.indexOf('//') === 0 ? 'https:' + image : image) });
+    });
+    if (!data.length) throw new Error('网易云未返回编辑推荐歌单，请稍后重试。');
+    return { isEnd: true, data: data };
+  });
 }
 
 async function topLists() {
@@ -876,12 +913,18 @@ module.exports = {
   },
 
   async getRecommendSheetTags() {
-    const tags = [{ id: 'public', title: '热门歌单' }, { id: 'my', title: '我的歌单' }, { id: 'account-check', title: '账号检查' }];
-    return { pinned: tags, data: [{ title: '歌单分类', data: tags }] };
+    const tags = [{ id: 'public', title: '热门歌单' }, { id: 'editor', title: '编辑推荐' }, { id: 'my', title: '我的歌单' }, { id: 'account-check', title: '账号检查' }];
+    const groups = [{ title: '常用', data: tags.slice(0, -1) }].concat(SHEET_CATEGORIES.map(function (group) {
+      return { title: group.title, data: group.names.map(function (name) { return { id: 'cat:' + name, title: name }; }) };
+    }));
+    groups.push({ title: '工具', data: [tags[tags.length - 1]] });
+    return { pinned: tags, data: groups };
   },
 
   async getRecommendSheetsByTag(tag, page) {
     if (!tag || !tag.id || tag.id === 'public') return publicSheets(page);
+    if (tag.id === 'editor') return editorSheets(page);
+    if (typeof tag.id === 'string' && tag.id.indexOf('cat:') === 0) return publicSheets(page, tag.id.slice(4));
     if (tag.id === 'account-check') return { isEnd: true, data: pageNumber(page) > 1 ? [] : await diagnoseAccount() };
     // Old open pages may briefly retain removed tag IDs after an update.
     if (['liked', 'sudi-check', 'diagnostic'].indexOf(tag.id) >= 0) return { isEnd: true, data: [] };
